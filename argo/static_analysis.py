@@ -279,8 +279,25 @@ def _local_def_use(symbol_node: Any, source: bytes, line: int,
         for name in sorted(_identifiers(lhs, source)):
             defs.setdefault(name, []).append((def_line, deps))
 
-    target = _smallest_node_at_line(symbol_node, line)
-    queue: list[tuple[str, int]] = [(name, line) for name in sorted(_identifiers(target, source))]
+    # Seed the backwards slice from every identifier on the cited source line.  Using the
+    # single smallest AST node is too narrow: for `sink(clean)` it can select the callee
+    # identifier `sink` and miss the argument `clean`, which is the value whose prior
+    # definition we actually want to trace.
+    line_identifiers: set[str] = set()
+    for node in _walk(symbol_node):
+        if node.type not in _IDENTIFIER_TYPES:
+            continue
+        start, end = _line_span(node)
+        if start <= line <= end:
+            text = _node_text(node, source).strip()
+            if text and not text[0].isdigit():
+                line_identifiers.add(text)
+
+    if not line_identifiers:
+        target = _smallest_node_at_line(symbol_node, line)
+        line_identifiers = _identifiers(target, source)
+
+    queue: list[tuple[str, int]] = [(name, line) for name in sorted(line_identifiers)]
     seen: set[tuple[str, int]] = set()
     steps: list[DefUseStep] = []
     while queue and len(steps) < max_steps:
