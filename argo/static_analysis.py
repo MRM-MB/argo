@@ -325,12 +325,11 @@ def _iter_source_files(root: Path, *, max_files: int = 1000) -> Iterable[Path]:
         yield path
 
 
-def _possible_incoming(repo_dir: Path, target_name: str,
-                       *, max_refs: int = 8) -> list[CallReference]:
-    terminal = _terminal_name(target_name)
-    if not terminal or terminal.startswith("<"):
-        return []
-    refs: list[CallReference] = []
+@lru_cache(maxsize=4)
+def _repo_call_index(repo_root: str) -> dict[str, tuple[CallReference, ...]]:
+    """Build a bounded name-only call index once per read-only repo copy."""
+    repo_dir = Path(repo_root)
+    index: dict[str, list[CallReference]] = {}
     for path in _iter_source_files(repo_dir):
         try:
             language, source, root = _parse_file(path)
@@ -344,15 +343,28 @@ def _possible_incoming(repo_dir: Path, target_name: str,
             if callee is None:
                 continue
             call_name = _node_text(callee, source).strip()
-            if _terminal_name(call_name) != terminal:
+            terminal = _terminal_name(call_name)
+            if not terminal:
                 continue
             line = _point_row(node.start_point) + 1
             caller = _enclosing_symbol(root, source, language, rel, line)
-            refs.append(CallReference(name=call_name, file=rel, line=line,
-                                      caller=caller.name if caller else None))
-            if len(refs) >= max_refs:
-                return refs
-    return refs
+            index.setdefault(terminal, []).append(
+                CallReference(name=call_name, file=rel, line=line,
+                              caller=caller.name if caller else None)
+            )
+    return {name: tuple(refs) for name, refs in index.items()}
+
+
+def _possible_incoming(repo_dir: Path, target_name: str,
+                       *, max_refs: int = 8) -> list[CallReference]:
+    terminal = _terminal_name(target_name)
+    if not terminal or terminal.startswith("<"):
+        return []
+    try:
+        refs = _repo_call_index(str(repo_dir.resolve())).get(terminal, ())
+    except Exception:  # noqa: BLE001 - optional enrichment must remain best-effort
+        return []
+    return list(refs[:max_refs])
 
 
 def analyze_location(repo_dir: Path, ref: str, *, max_incoming: int = 8) -> StaticContext:
