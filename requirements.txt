@@ -8,6 +8,13 @@ typer>=0.12
 # HTTP API (server/) — the backend for the web UI
 fastapi>=0.110
 uvicorn>=0.27
+
+# Parse-only validation metadata (no target build or execution)
+tree-sitter>=0.25
+tree-sitter-python>=0.25
+tree-sitter-javascript>=0.25
+tree-sitter-typescript>=0.23
+tree-sitter-c-sharp>=0.23
 python-multipart>=0.0.32   # repo .zip upload (FastAPI File/UploadFile)
 
 # dev / test
