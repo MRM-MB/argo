@@ -193,3 +193,17 @@ def test_cited_file_over_static_analysis_limit_is_skipped(tmp_path):
     ctx = analyze_location(tmp_path, "large.py:2")
 
     assert any("exceeds static-analysis byte limit" in note for note in ctx.notes)
+
+
+def test_static_context_handles_a_real_world_sized_python_function(tmp_path):
+    """Regression for a native Tree-sitter 0.26 crash on larger Python trees."""
+    body = "\n".join(f"    value_{i} = normalize(value_{i - 1})" for i in range(1, 800))
+    (tmp_path / "realistic.py").write_text(
+        "def normalize(value):\n    return value\n\n"
+        "def prepare(value_0):\n" + body + "\n    return value_799\n",
+        encoding="utf-8",
+    )
+
+    rendered = build_static_context(tmp_path, ["realistic.py:535"])
+
+    assert "prepare" in rendered
