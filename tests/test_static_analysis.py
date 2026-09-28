@@ -4,7 +4,7 @@ import json
 
 import pytest
 
-from argo.static_analysis import analyze_location, build_static_context
+from argo.static_analysis import _iter_source_files, analyze_location, build_static_context
 
 
 @pytest.mark.parametrize(
@@ -102,3 +102,60 @@ def test_static_context_is_explicitly_non_semantic(tmp_path):
     assert "does NOT prove runtime reachability" in first
     data = json.loads(payload)
     assert data[0]["symbol"]["name"] == "f"
+
+
+def test_calls_and_serialized_context_are_hard_bounded(tmp_path):
+    calls = "\n".join(f"    call_{i}(value)" for i in range(200))
+    (tmp_path / "many_calls.py").write_text(
+        "def handler(value):\n" + calls + "\n",
+        encoding="utf-8",
+    )
+
+    ctx = analyze_location(tmp_path, "many_calls.py:2")
+    assert len(ctx.calls) == 64
+
+    rendered = build_static_context(tmp_path, ["many_calls.py:2"], max_bytes=1024)
+    assert len(rendered.encode("utf-8")) <= 1024
+    assert (
+        "static context truncated to byte budget" in rendered
+        or "static context omitted: byte budget exceeded" in rendered
+        or "deterministic static context omitted" in rendered
+    )
+
+
+def test_source_scan_is_sorted_pruned_and_size_bounded(tmp_path):
+    (tmp_path / "b.py").write_text("print('b')\n", encoding="utf-8")
+    (tmp_path / "a.py").write_text("print('a')\n", encoding="utf-8")
+    (tmp_path / "too_large.py").write_text("x = '" + ("z" * 500) + "'\n", encoding="utf-8")
+    skipped = tmp_path / "node_modules"
+    skipped.mkdir()
+    (skipped / "first.py").write_text("print('skip')\n", encoding="utf-8")
+
+    files = list(_iter_source_files(
+        tmp_path, max_files=10, max_file_bytes=100, max_total_bytes=1000
+    ))
+
+    assert [path.name for path in files] == ["a.py", "b.py"]
+    assert all("node_modules" not in path.parts for path in files)
+
+
+def test_possible_incoming_order_is_reproducible(tmp_path):
+    (tmp_path / "target.py").write_text(
+        "def handler(value):\n    return value\n",
+        encoding="utf-8",
+    )
+    (tmp_path / "b.py").write_text(
+        "from target import handler\n\ndef caller_b(v):\n    return handler(v)\n",
+        encoding="utf-8",
+    )
+    (tmp_path / "a.py").write_text(
+        "from target import handler\n\ndef caller_a(v):\n    return handler(v)\n",
+        encoding="utf-8",
+    )
+
+    ctx = analyze_location(tmp_path, "target.py:2")
+
+    assert [(ref.file, ref.caller) for ref in ctx.possible_incoming[:2]] == [
+        ("a.py", "caller_a"),
+        ("b.py", "caller_b"),
+    ]
