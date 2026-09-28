@@ -12,6 +12,7 @@ from __future__ import annotations
 
 from dataclasses import asdict, dataclass, field
 from functools import lru_cache
+import os
 from pathlib import Path
 from typing import Any, Iterable
 
@@ -52,6 +53,12 @@ _CALL_TYPES = {
 }
 
 _IDENTIFIER_TYPES = {"identifier", "type_identifier", "property_identifier", "field_identifier"}
+
+_MAX_CALLS_PER_SYMBOL = 64
+_MAX_STATIC_CONTEXT_BYTES = 16 * 1024
+_MAX_INDEX_FILES = 1000
+_MAX_INDEX_FILE_BYTES = 512 * 1024
+_MAX_INDEX_TOTAL_BYTES = 8 * 1024 * 1024
 
 
 @dataclass(frozen=True)
@@ -224,11 +231,15 @@ def _terminal_name(text: str) -> str:
     return text.strip()
 
 
-def _calls_within(node: Any, source: bytes, language: str, file: str) -> list[CallReference]:
+def _calls_within(node: Any, source: bytes, language: str, file: str,
+                  *, max_calls: int = _MAX_CALLS_PER_SYMBOL) -> list[CallReference]:
+    """Return at most max_calls syntactic calls from one enclosing symbol."""
     calls: list[CallReference] = []
     seen: set[tuple[str, int]] = set()
 
     def visit(cur: Any, top: bool = False) -> None:
+        if len(calls) >= max_calls:
+            return
         if not top and cur.type in _FUNCTION_TYPES[language]:
             return
         if cur.type in _CALL_TYPES[language]:
@@ -240,8 +251,12 @@ def _calls_within(node: Any, source: bytes, language: str, file: str) -> list[Ca
                 if name and key not in seen:
                     seen.add(key)
                     calls.append(CallReference(name=name, file=file, line=line))
+                    if len(calls) >= max_calls:
+                        return
         for child in _named_children(cur):
             visit(child)
+            if len(calls) >= max_calls:
+                return
 
     visit(node, top=True)
     return calls
@@ -325,21 +340,43 @@ def _parse_file(path: Path) -> tuple[str, bytes, Any]:
     return language, source, tree.root_node
 
 
-def _iter_source_files(root: Path, *, max_files: int = 1000) -> Iterable[Path]:
+def _iter_source_files(
+    root: Path,
+    *,
+    max_files: int = _MAX_INDEX_FILES,
+    max_file_bytes: int = _MAX_INDEX_FILE_BYTES,
+    max_total_bytes: int = _MAX_INDEX_TOTAL_BYTES,
+) -> Iterable[Path]:
+    """Yield source files deterministically while bounding traversal work and bytes parsed.
+
+    os.walk lets us prune skipped directories before descent, unlike Path.rglob.
+    Directory and filename ordering is sorted so the bounded prefix is reproducible.
+    """
+    root = root.resolve()
     count = 0
-    for path in root.rglob("*"):
-        if count >= max_files:
-            return
-        if not path.is_file() or _language_for(path) is None:
-            continue
-        try:
-            rel_parts = path.relative_to(root).parts
-        except ValueError:
-            continue
-        if any(part in _SKIP_DIRS for part in rel_parts):
-            continue
-        count += 1
-        yield path
+    total_bytes = 0
+    for dirpath, dirnames, filenames in os.walk(root):
+        dirnames[:] = sorted(d for d in dirnames if d not in _SKIP_DIRS)
+        for filename in sorted(filenames):
+            if count >= max_files:
+                return
+            path = Path(dirpath) / filename
+            if _language_for(path) is None:
+                continue
+            try:
+                resolved = path.resolve()
+                if not resolved.is_relative_to(root) or not resolved.is_file():
+                    continue
+                size = resolved.stat().st_size
+            except OSError:
+                continue
+            if size > max_file_bytes:
+                continue
+            if total_bytes + size > max_total_bytes:
+                return
+            count += 1
+            total_bytes += size
+            yield resolved
 
 
 @lru_cache(maxsize=4)
@@ -430,8 +467,68 @@ def analyze_location(repo_dir: Path, ref: str, *, max_incoming: int = 8) -> Stat
     return ctx
 
 
-def build_static_context(repo_dir: Path, affected: list[str], *, max_locations: int = 3) -> str:
-    """Format deterministic static context for validation prompts.
+def _serialized_static_context(contexts: list[dict[str, Any]], max_bytes: int) -> str:
+    """Serialize context under a hard UTF-8 byte budget, preserving valid JSON when possible."""
+    import json
+
+    header = (
+        "SYNTACTIC EVIDENCE ONLY - this does NOT prove runtime reachability, data flow, control "
+        "flow, exploitability, or vulnerability. Name-matched incoming references are possible "
+        "callers, not a resolved call graph. Source code remains authoritative.\n"
+    )
+
+    def render(items: list[dict[str, Any]]) -> str:
+        return header + json.dumps(items, indent=2)
+
+    rendered = render(contexts)
+    if len(rendered.encode("utf-8")) <= max_bytes:
+        return rendered
+
+    trimmed = json.loads(json.dumps(contexts))
+    for item in trimmed:
+        item.setdefault("notes", []).append("static context truncated to byte budget")
+
+    list_fields = ("calls", "possible_incoming", "local_def_use")
+    while True:
+        rendered = render(trimmed)
+        if len(rendered.encode("utf-8")) <= max_bytes:
+            return rendered
+        changed = False
+        for item in reversed(trimmed):
+            for field_name in list_fields:
+                values = item.get(field_name)
+                if isinstance(values, list) and values:
+                    values.pop()
+                    changed = True
+                    break
+            if changed:
+                break
+        if not changed:
+            break
+
+    minimal = [
+        {
+            "location": str(item.get("location", ""))[:256],
+            "notes": ["static context omitted: byte budget exceeded"],
+        }
+        for item in trimmed
+    ]
+    rendered = render(minimal)
+    if len(rendered.encode("utf-8")) <= max_bytes:
+        return rendered
+
+    fallback = "(deterministic static context omitted: byte budget exceeded)"
+    return fallback if len(fallback.encode("utf-8")) <= max_bytes else ""
+
+
+def build_static_context(
+    repo_dir: Path,
+    affected: list[str],
+    *,
+    max_locations: int = 3,
+    max_bytes: int = _MAX_STATIC_CONTEXT_BYTES,
+) -> str:
+    """Format deterministic static context for validation prompts under a hard byte bound.
 
     Unsupported or malformed locations never break validation and never alter a verdict by
     themselves; they simply produce an unavailable-context note.
@@ -447,11 +544,4 @@ def build_static_context(repo_dir: Path, affected: list[str], *, max_locations: 
             })
     if not contexts:
         return "(no deterministic static context available)"
-
-    import json
-    return (
-        "SYNTACTIC EVIDENCE ONLY - this does NOT prove runtime reachability, data flow, control "
-        "flow, exploitability, or vulnerability. Name-matched incoming references are possible "
-        "callers, not a resolved call graph. Source code remains authoritative.\n"
-        + json.dumps(contexts, indent=2)
-    )
+    return _serialized_static_context(contexts, max_bytes)
