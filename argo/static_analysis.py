@@ -57,8 +57,10 @@ _IDENTIFIER_TYPES = {"identifier", "type_identifier", "property_identifier", "fi
 _MAX_CALLS_PER_SYMBOL = 64
 _MAX_STATIC_CONTEXT_BYTES = 16 * 1024
 _MAX_INDEX_FILES = 1000
-_MAX_INDEX_FILE_BYTES = 512 * 1024
+_MAX_ANALYZED_FILE_BYTES = 512 * 1024
 _MAX_INDEX_TOTAL_BYTES = 8 * 1024 * 1024
+_MAX_INDEX_REFS_PER_NAME = 8
+_MAX_INDEX_REFS_TOTAL = 8192
 
 
 @dataclass(frozen=True)
@@ -192,15 +194,7 @@ def _symbol_kind(node: Any) -> str:
     return "function"
 
 
-def _enclosing_symbol(root: Any, source: bytes, language: str, file: str,
-                      line: int) -> StaticSymbol | None:
-    candidates = [
-        n for n in _walk(root)
-        if n.type in _FUNCTION_TYPES[language] and _contains_line(n, line)
-    ]
-    if not candidates:
-        return None
-    node = min(candidates, key=lambda n: n.end_byte - n.start_byte)
+def _symbol_from_node(node: Any, source: bytes, file: str) -> StaticSymbol:
     start, end = _line_span(node)
     return StaticSymbol(
         name=_symbol_name(node, source), kind=_symbol_kind(node), file=file,
@@ -208,10 +202,16 @@ def _enclosing_symbol(root: Any, source: bytes, language: str, file: str,
     )
 
 
-def _find_symbol_node(root: Any, language: str, line: int) -> Any | None:
-    nodes = [n for n in _walk(root)
-             if n.type in _FUNCTION_TYPES[language] and _contains_line(n, line)]
-    return min(nodes, key=lambda n: n.end_byte - n.start_byte) if nodes else None
+def _enclosing_symbol_node(root: Any, language: str, line: int) -> Any | None:
+    """Find the innermost containing symbol without walking the whole AST."""
+    if line < 1:
+        return None
+    node = root.descendant_for_point_range((line - 1, 0), (line - 1, 0))
+    while node is not None:
+        if node.type in _FUNCTION_TYPES[language] and _contains_line(node, line):
+            return node
+        node = getattr(node, "parent", None)
+    return None
 
 
 def _callee_node(node: Any) -> Any | None:
@@ -344,7 +344,7 @@ def _iter_source_files(
     root: Path,
     *,
     max_files: int = _MAX_INDEX_FILES,
-    max_file_bytes: int = _MAX_INDEX_FILE_BYTES,
+    max_file_bytes: int = _MAX_ANALYZED_FILE_BYTES,
     max_total_bytes: int = _MAX_INDEX_TOTAL_BYTES,
 ) -> Iterable[Path]:
     """Yield source files deterministically while bounding traversal work and bytes parsed.
@@ -384,28 +384,44 @@ def _repo_call_index(repo_root: str) -> dict[str, tuple[CallReference, ...]]:
     """Build a bounded name-only call index once per read-only repo copy."""
     repo_dir = Path(repo_root)
     index: dict[str, list[CallReference]] = {}
+    stored_refs = 0
     for path in _iter_source_files(repo_dir):
         try:
             language, source, root = _parse_file(path)
         except (OSError, ValueError, ImportError):
             continue
         rel = path.relative_to(repo_dir).as_posix()
-        for node in _walk(root):
+
+        def visit(node: Any, caller: str | None = None) -> bool:
+            nonlocal stored_refs
+            if node.type in _FUNCTION_TYPES[language]:
+                caller = _symbol_name(node, source)
             if node.type not in _CALL_TYPES[language]:
-                continue
+                for child in _named_children(node):
+                    if visit(child, caller):
+                        return True
+                return False
+
             callee = _callee_node(node)
-            if callee is None:
-                continue
-            call_name = _node_text(callee, source).strip()
-            terminal = _terminal_name(call_name)
-            if not terminal:
-                continue
-            line = _point_row(node.start_point) + 1
-            caller = _enclosing_symbol(root, source, language, rel, line)
-            index.setdefault(terminal, []).append(
-                CallReference(name=call_name, file=rel, line=line,
-                              caller=caller.name if caller else None)
-            )
+            if callee is not None:
+                call_name = _node_text(callee, source).strip()
+                terminal = _terminal_name(call_name)
+                refs = index.setdefault(terminal, []) if terminal else []
+                if terminal and len(refs) < _MAX_INDEX_REFS_PER_NAME:
+                    refs.append(CallReference(
+                        name=call_name, file=rel,
+                        line=_point_row(node.start_point) + 1, caller=caller,
+                    ))
+                    stored_refs += 1
+                    if stored_refs >= _MAX_INDEX_REFS_TOTAL:
+                        return True
+            for child in _named_children(node):
+                if visit(child, caller):
+                    return True
+            return False
+
+        if visit(root):
+            break
     return {name: tuple(refs) for name, refs in index.items()}
 
 
@@ -444,6 +460,13 @@ def analyze_location(repo_dir: Path, ref: str, *, max_incoming: int = 8) -> Stat
         ctx.notes.append("citation line is not an integer")
         return ctx
     try:
+        if path.stat().st_size > _MAX_ANALYZED_FILE_BYTES:
+            ctx.notes.append("cited source exceeds static-analysis byte limit")
+            return ctx
+    except OSError:
+        ctx.notes.append("static parse unavailable: OSError")
+        return ctx
+    try:
         language, source, tree_root = _parse_file(path)
     except ImportError:
         ctx.notes.append("tree-sitter parser dependencies are unavailable")
@@ -453,12 +476,12 @@ def analyze_location(repo_dir: Path, ref: str, *, max_incoming: int = 8) -> Stat
         return ctx
 
     rel = path.relative_to(root).as_posix()
-    symbol = _enclosing_symbol(tree_root, source, language, rel, line)
-    ctx.symbol = symbol
-    symbol_node = _find_symbol_node(tree_root, language, line)
+    symbol_node = _enclosing_symbol_node(tree_root, language, line)
     if symbol_node is None:
         ctx.notes.append("no enclosing function/method found for cited line")
         return ctx
+    symbol = _symbol_from_node(symbol_node, source, rel)
+    ctx.symbol = symbol
 
     ctx.calls = _calls_within(symbol_node, source, language, rel)
     ctx.local_def_use = _local_def_use(symbol_node, source, line)

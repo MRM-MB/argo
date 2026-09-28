@@ -4,7 +4,13 @@ import json
 
 import pytest
 
-from argo.static_analysis import _iter_source_files, analyze_location, build_static_context
+from argo.static_analysis import (
+    _MAX_INDEX_REFS_PER_NAME,
+    _iter_source_files,
+    _repo_call_index,
+    analyze_location,
+    build_static_context,
+)
 
 
 @pytest.mark.parametrize(
@@ -159,3 +165,31 @@ def test_possible_incoming_order_is_reproducible(tmp_path):
         ("a.py", "caller_a"),
         ("b.py", "caller_b"),
     ]
+
+
+def test_dense_call_index_is_bounded_without_rewalking_the_tree(tmp_path):
+    calls = "\n".join("    target(value)" for _ in range(500))
+    (tmp_path / "dense.py").write_text(
+        "def target(value):\n    return value\n\n"
+        "def handler(value):\n" + calls + "\n",
+        encoding="utf-8",
+    )
+
+    _repo_call_index.cache_clear()
+    ctx = analyze_location(tmp_path, "dense.py:2")
+    index = _repo_call_index(str(tmp_path.resolve()))
+
+    assert ctx.symbol is not None and ctx.symbol.name == "target"
+    assert len(ctx.possible_incoming) == _MAX_INDEX_REFS_PER_NAME
+    assert len(index["target"]) == _MAX_INDEX_REFS_PER_NAME
+
+
+def test_cited_file_over_static_analysis_limit_is_skipped(tmp_path):
+    (tmp_path / "large.py").write_text(
+        "def handler():\n    return '" + ("x" * (512 * 1024)) + "'\n",
+        encoding="utf-8",
+    )
+
+    ctx = analyze_location(tmp_path, "large.py:2")
+
+    assert any("exceeds static-analysis byte limit" in note for note in ctx.notes)
